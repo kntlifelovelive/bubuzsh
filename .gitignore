@@ -1,0 +1,3 @@
+# Runtime artifacts — never commit (history leak / regenerates at startup)
+zsh/.zhistory
+zsh/.zcompdump*

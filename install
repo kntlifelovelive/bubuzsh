@@ -1,0 +1,201 @@
+#!/usr/bin/env bash
+# BuBuZsh installer — copy-based, user-level, cross-distro.
+# Supported distributions: Arch Linux, Debian, Ubuntu.
+# Usage: ./install
+set -u
+
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+SRC_DIR="$SCRIPT_DIR/zsh"
+OS_RELEASE_FILE="/etc/os-release"
+
+err() {
+    echo "ERROR: $*" >&2
+    exit 1
+}
+
+unsupported() {
+    echo "Unsupported distribution."
+    echo "Supported:"
+    echo "- Arch Linux"
+    echo "- Debian"
+    echo "- Ubuntu"
+    exit 1
+}
+
+# ------------------------------------------------------------- [1/6] detect
+echo "[1/6] Detecting system..."
+
+[[ -n "${HOME:-}" && "$HOME" == /* && "$HOME" != "/" ]] ||
+    err "HOME is not set to a valid user directory."
+
+if (( EUID == 0 )); then
+    echo "ERROR: BuBuZsh should be installed for a normal user." >&2
+    echo "Please run the installer as the user who will use Zsh." >&2
+    exit 1
+fi
+
+[[ -f "$OS_RELEASE_FILE" ]] || unsupported
+# /etc/os-release is a system-provided, shell-compatible file
+. "$OS_RELEASE_FILE"
+
+case "${ID:-}" in
+    arch)            PKG_MGR="pacman" ;;
+    debian | ubuntu) PKG_MGR="apt" ;;
+    *)               unsupported ;;
+esac
+
+echo "      OS:    ${PRETTY_NAME:-${ID:-unknown}} (ID=${ID:-?} ID_LIKE=${ID_LIKE:-none} VERSION_ID=${VERSION_ID:-?})"
+echo "      Pkg:   $PKG_MGR"
+echo "      User:  $(id -un 2>/dev/null || echo unknown)  HOME=$HOME"
+
+# -------------------------------------------------------- [2/6] dependencies
+echo "[2/6] Checking dependencies..."
+
+# Required: zsh only. Optional tools (fzf, zoxide, git) are handled safely by
+# the configuration itself and are deliberately NOT installed here.
+missing=()
+for cmd in zsh; do
+    if command -v "$cmd" >/dev/null 2>&1; then
+        echo "      $cmd: found ($(command -v "$cmd"))"
+    else
+        echo "      $cmd: missing"
+        missing+=("$cmd")
+    fi
+done
+
+for cmd in fzf zoxide git; do
+    if command -v "$cmd" >/dev/null 2>&1; then
+        echo "      $cmd: found (optional)"
+    else
+        echo "      $cmd: not installed (optional, safe to omit)"
+    fi
+done
+
+if (( ${#missing[@]} > 0 )); then
+    # package name mapping (identical names on all supported distributions)
+    pkg_name() {
+        case "$1" in
+            zsh) echo zsh ;;
+            *)   echo "$1" ;;
+        esac
+    }
+
+    command -v "$PKG_MGR" >/dev/null 2>&1 ||
+        err "$PKG_MGR not found — cannot install required packages."
+    command -v sudo >/dev/null 2>&1 ||
+        err "sudo is required to install packages. Install zsh manually and re-run."
+
+    for cmd in "${missing[@]}"; do
+        pkg="$(pkg_name "$cmd")"
+        echo "      Installing $pkg via $PKG_MGR..."
+        case "$PKG_MGR" in
+            pacman)
+                sudo pacman -S --needed --noconfirm "$pkg" ||
+                    err "$pkg installation failed."
+                ;;
+            apt)
+                sudo apt-get update || err "apt-get update failed."
+                sudo apt-get install -y "$pkg" ||
+                    err "$pkg installation failed."
+                ;;
+        esac
+        command -v "$cmd" >/dev/null 2>&1 || err "$cmd installation failed."
+        echo "      $cmd: installed"
+    done
+fi
+
+# -------------------------------------------------------- [3/6] validate src
+echo "[3/6] Validating BuBuZsh source..."
+
+for required in "$SRC_DIR" "$SRC_DIR/.zshenv" "$SRC_DIR/.zshrc" \
+                "$SRC_DIR/TerminZsh_Banner"; do
+    [[ -e "$required" ]] || err "BuBuZsh source is incomplete."
+done
+
+src_syntax_fail=0
+src_count=0
+while IFS= read -r f; do
+    src_count=$((src_count + 1))
+    if ! zsh -n "$f" 2>/dev/null; then
+        echo "ERROR: Configuration validation failed: $f" >&2
+        src_syntax_fail=1
+    fi
+done < <(find "$SRC_DIR" \( -name '*.zsh' -o -name '.zshrc' -o -name '.zshenv' \) -type f)
+(( src_syntax_fail == 0 )) || exit 1
+echo "      Source OK ($src_count files passed zsh -n)"
+
+# ------------------------------------------------------- [4/6] backup + copy
+echo "[4/6] Creating backup and installing BuBuZsh..."
+
+TARGET="$HOME/.config/zsh"
+BACKUP="(none — no existing configuration)"
+
+if [[ -e "$HOME/.zshenv" || -e "$TARGET" ]]; then
+    stamp="$(date +%Y%m%d-%H%M%S)"
+    BACKUP="$HOME/.config/zsh-backup-$stamp"
+    n=1
+    while [[ -e "$BACKUP" ]]; do
+        n=$((n + 1))
+        BACKUP="$HOME/.config/zsh-backup-$stamp-$n"
+    done
+    mkdir -p "$BACKUP" || err "Could not create backup directory."
+    if [[ -e "$HOME/.zshenv" ]]; then
+        cp -a "$HOME/.zshenv" "$BACKUP/.zshenv" || err "Backup failed."
+    fi
+    if [[ -e "$TARGET" ]]; then
+        cp -a "$TARGET" "$BACKUP/zsh" || err "Backup failed."
+    fi
+    echo "      Existing configuration backed up to: $BACKUP"
+fi
+
+# copy-based install (never symlinks): stage first, then activate
+mkdir -p "$HOME/.config" || err "Could not create ~/.config."
+STAGE="$HOME/.config/.zsh-new.$$"
+rm -rf "$STAGE"
+cp -a "$SRC_DIR" "$STAGE" || { rm -rf "$STAGE"; err "Copy failed."; }
+rm -rf "$TARGET"
+mv "$STAGE" "$TARGET" || err "Could not activate configuration."
+cp -a "$SRC_DIR/.zshenv" "$HOME/.zshenv" || err "Could not write ~/.zshenv."
+
+# banner protection: it must be present after copying (installed, never altered)
+[[ -d "$TARGET/TerminZsh_Banner" ]] ||
+    err "Banner directory was not installed."
+
+echo "      Installed: $TARGET"
+echo "      Installed: $HOME/.zshenv"
+
+# ------------------------------------------------ [5/6] validate + startup
+echo "[5/6] Validating installed configuration..."
+
+inst_syntax_fail=0
+inst_count=0
+while IFS= read -r f; do
+    inst_count=$((inst_count + 1))
+    if ! zsh -n "$f" 2>/dev/null; then
+        echo "ERROR: Configuration validation failed: $f" >&2
+        inst_syntax_fail=1
+    fi
+done < <(find "$TARGET" \( -name '*.zsh' -o -name '.zshrc' -o -name '.zshenv' \) -type f)
+(( inst_syntax_fail == 0 )) || exit 1
+echo "      zsh -n: OK ($inst_count installed files)"
+
+# Non-destructive startup test. stdin comes from /dev/null so the test can
+# never block the installer (an interactive shell started under a
+# non-job-controlling parent would otherwise stop itself on tty access).
+# Banner output goes to stdout and is discarded; only stderr is inspected.
+# ZDOTDIR is unset so the freshly installed ~/.zshenv is exercised.
+startup_err="$(env -u ZDOTDIR timeout 30 zsh -lic 'exit' </dev/null 2>&1 >/dev/null)"
+startup_rc=$?
+if (( startup_rc != 0 )) || [[ -n "$startup_err" ]]; then
+    [[ -z "$startup_err" ]] || printf '%s\n' "$startup_err" >&2
+    err "Startup test failed (RC=$startup_rc)."
+fi
+echo "      Startup test: RC=0, stderr empty"
+
+# ------------------------------------------------------------- [6/6] done
+echo "[6/6] Installation complete"
+echo "      Config: $TARGET"
+echo "      Zshenv: $HOME/.zshenv"
+echo "      Backup: $BACKUP"
+echo "      Start a new zsh session to use BuBuZsh."
+exit 0
