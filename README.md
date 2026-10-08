@@ -28,8 +28,3 @@ Behavior:
 
 Re-running is safe: current configuration is backed up and replaced; nothing
 is ever appended twice.
-
-## Documentation
-
-- `docs/FINAL-REVIEW.md` — final validation status
-- `docs/PHASE-00-AUDIT.md`, `docs/PHASE-01-STEP-*.md` — project history
