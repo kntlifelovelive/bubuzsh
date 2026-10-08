@@ -4,34 +4,90 @@
 # Usage: ./install
 set -u
 
+# ----------------------------------------------------------------- palette
+RED='\033[31m'
+GREEN='\033[32m'
+YELLOW='\033[33m'
+BLUE='\033[34m'
+CYAN='\033[36m'
+BOLD='\033[1m'
+DIM='\033[2m'
+RESET='\033[0m'
+
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 SRC_DIR="$SCRIPT_DIR/zsh"
 OS_RELEASE_FILE="/etc/os-release"
 
+# -------------------------------------------------------------- UI helpers
 err() {
-    echo "ERROR: $*" >&2
+    printf '%bERROR:%b %s\n' "$RED" "$RESET" "$*" >&2
     exit 1
 }
 
 unsupported() {
-    echo "Unsupported distribution."
-    echo "Supported:"
-    echo "- Arch Linux"
-    echo "- Debian"
-    echo "- Ubuntu"
+    printf '%bERROR:%b Unsupported distribution.\n' "$RED" "$RESET" >&2
+    printf 'Supported:\n- Arch Linux\n- Debian\n- Ubuntu\n' >&2
     exit 1
 }
 
+ui_title() {
+    printf '%b' "$BOLD$BLUE"
+    printf '╔════════════════════════════════════════════════════════════╗\n'
+    printf '║%b' "$RESET$BOLD"
+    printf '                          BuBuZsh'
+    printf '%b' "$RESET$BOLD"
+    printf '                           ║\n'
+    printf '║%b' "$RESET$CYAN"
+    printf '             Oh My Zsh • Custom Zsh Environment'
+    printf '%b' "$RESET$BOLD"
+    printf '             ║\n'
+    printf '%b' "$RESET$BLUE"
+    printf '╚════════════════════════════════════════════════════════════╝\n'
+    printf '%b' "$RESET"
+}
+
+ui_stage() {
+    printf '\n%b[%s]%b %b%s%b\n' "$BOLD$CYAN" "$1" "$RESET" "$BOLD" "$2" "$RESET"
+}
+
+ui_sub() {
+    printf '      %b%s%b\n' "$BOLD$BLUE" "$1" "$RESET"
+}
+
+ui_ok() {
+    printf '      %b✓%b %s\n' "$GREEN" "$RESET" "$1"
+}
+
+ui_warn() {
+    printf '      %b✗%b %s\n' "$YELLOW" "$RESET" "$1"
+}
+
+ui_info() {
+    printf '      %b%s%b\n' "$DIM" "$1" "$RESET"
+}
+
+ui_kv() {
+    printf '      %b%-8s%b : %s\n' "$CYAN" "$1" "$RESET" "$2"
+}
+
+ui_done() {
+    printf '%b' "$BOLD$GREEN"
+    printf '╔════════════════════════════════════════════════════════════╗\n'
+    printf '║               BuBuZsh installed successfully               ║\n'
+    printf '%b' "$BLUE"
+    printf '╚════════════════════════════════════════════════════════════╝\n'
+    printf '%b' "$RESET"
+}
+
 # ------------------------------------------------------------- [1/6] detect
-echo "[1/6] Detecting system..."
+ui_title
+ui_stage "1/6" "Detecting system..."
 
 [[ -n "${HOME:-}" && "$HOME" == /* && "$HOME" != "/" ]] ||
     err "HOME is not set to a valid user directory."
 
 if (( EUID == 0 )); then
-    echo "ERROR: BuBuZsh should be installed for a normal user." >&2
-    echo "Please run the installer as the user who will use Zsh." >&2
-    exit 1
+    err "BuBuZsh should be installed for a normal user — run the installer as the user who will use Zsh."
 fi
 
 [[ -f "$OS_RELEASE_FILE" ]] || unsupported
@@ -44,68 +100,169 @@ case "${ID:-}" in
     *)               unsupported ;;
 esac
 
-echo "      OS:    ${PRETTY_NAME:-${ID:-unknown}} (ID=${ID:-?} ID_LIKE=${ID_LIKE:-none} VERSION_ID=${VERSION_ID:-?})"
-echo "      Pkg:   $PKG_MGR"
-echo "      User:  $(id -un 2>/dev/null || echo unknown)  HOME=$HOME"
+ui_kv "OS"      "${PRETTY_NAME:-${ID:-unknown}}"
+ui_kv "Package" "$PKG_MGR"
+ui_kv "User"    "$(id -un 2>/dev/null || echo unknown)"
+ui_kv "HOME"    "$HOME"
 
 # -------------------------------------------------------- [2/6] dependencies
-echo "[2/6] Checking dependencies..."
+ui_stage "2/6" "Checking dependencies..."
 
-# Required: zsh only. Optional tools (fzf, zoxide, git) are handled safely by
-# the configuration itself and are deliberately NOT installed here.
-missing=()
-for cmd in zsh; do
-    if command -v "$cmd" >/dev/null 2>&1; then
-        echo "      $cmd: found ($(command -v "$cmd"))"
-    else
-        echo "      $cmd: missing"
-        missing+=("$cmd")
+# Required by the installed BuBuZsh configuration:
+#   zsh      — the shell itself
+#   git      — Oh My Zsh + plugin installation, git prompt indicator
+#   fzf      — modules/fzf.zsh widgets
+#   zoxide   — modules/zoxide.zsh
+#   clipboard backend (wl-clipboard / xclip / xsel) — zsh-system-clipboard
+REQUIRED_CMDS=(zsh git fzf zoxide)
+
+pkg_for() {
+    case "$1" in
+        zsh)             echo zsh ;;
+        git)             echo git ;;
+        fzf)             echo fzf ;;
+        zoxide)          echo zoxide ;;
+        wl-copy|wl-paste) echo wl-clipboard ;;
+        xclip)           echo xclip ;;
+        xsel)            echo xsel ;;
+        *)               echo "$1" ;;
+    esac
+}
+
+missing_pkgs=()
+for cmd in "${REQUIRED_CMDS[@]}"; do
+    command -v "$cmd" >/dev/null 2>&1 || missing_pkgs+=("$(pkg_for "$cmd")")
+done
+
+# zsh-system-clipboard needs at least one usable clipboard backend.
+# Prefer an already-available backend; never require all three.
+clipboard_backend=""
+for cand in wl-copy xclip xsel; do
+    if command -v "$cand" >/dev/null 2>&1; then
+        clipboard_backend="$cand"
+        break
     fi
 done
 
-for cmd in fzf zoxide git; do
-    if command -v "$cmd" >/dev/null 2>&1; then
-        echo "      $cmd: found (optional)"
+if [[ -z "$clipboard_backend" ]]; then
+    # No backend at all: Wayland/Hyprland/Niri (or unknown) → wl-clipboard,
+    # plain X11 → xclip.
+    if [[ "${XDG_SESSION_TYPE:-}" == "x11" && -z "${WAYLAND_DISPLAY:-}" ]]; then
+        want_clipboard="xclip"
     else
-        echo "      $cmd: not installed (optional, safe to omit)"
+        want_clipboard="wl-clipboard"
     fi
-done
+    missing_pkgs+=("$want_clipboard")
+fi
 
-if (( ${#missing[@]} > 0 )); then
-    # package name mapping (identical names on all supported distributions)
-    pkg_name() {
-        case "$1" in
-            zsh) echo zsh ;;
-            *)   echo "$1" ;;
-        esac
-    }
-
+if (( ${#missing_pkgs[@]} > 0 )); then
     command -v "$PKG_MGR" >/dev/null 2>&1 ||
         err "$PKG_MGR not found — cannot install required packages."
     command -v sudo >/dev/null 2>&1 ||
-        err "sudo is required to install packages. Install zsh manually and re-run."
+        err "sudo is required to install packages. Install them manually and re-run."
 
-    for cmd in "${missing[@]}"; do
-        pkg="$(pkg_name "$cmd")"
-        echo "      Installing $pkg via $PKG_MGR..."
-        case "$PKG_MGR" in
-            pacman)
-                sudo pacman -S --needed --noconfirm "$pkg" ||
-                    err "$pkg installation failed."
-                ;;
-            apt)
-                sudo apt-get update || err "apt-get update failed."
-                sudo apt-get install -y "$pkg" ||
-                    err "$pkg installation failed."
-                ;;
-        esac
-        command -v "$cmd" >/dev/null 2>&1 || err "$cmd installation failed."
-        echo "      $cmd: installed"
-    done
+    ui_info "Installing via $PKG_MGR: ${missing_pkgs[*]}"
+    case "$PKG_MGR" in
+        pacman)
+            sudo pacman -S --needed --noconfirm "${missing_pkgs[@]}" ||
+                err "Package installation failed: ${missing_pkgs[*]}"
+            ;;
+        apt)
+            sudo apt-get update || err "apt-get update failed."
+            sudo apt-get install -y "${missing_pkgs[@]}" ||
+                err "Package installation failed: ${missing_pkgs[*]}"
+            ;;
+    esac
 fi
 
+# Verify required packages (fail loudly — never fake a PASS).
+for cmd in "${REQUIRED_CMDS[@]}"; do
+    command -v "$cmd" >/dev/null 2>&1 ||
+        err "$cmd ($(pkg_for "$cmd")) is required but is not available after installation."
+done
+for cand in wl-copy xclip xsel; do
+    if command -v "$cand" >/dev/null 2>&1; then
+        clipboard_backend="$cand"
+        break
+    fi
+done
+[[ -n "$clipboard_backend" ]] ||
+    err "No clipboard backend available (install wl-clipboard, xclip or xsel)."
+
+ui_sub "Required packages"
+for cmd in "${REQUIRED_CMDS[@]}"; do
+    ui_ok "$cmd"
+done
+ui_ok "$(pkg_for "$clipboard_backend")"
+ui_info "clipboard backend: $clipboard_backend"
+
+# ------------------------------------------------------- [2/6] Oh My Zsh
+ui_sub "Oh My Zsh"
+
+OMZ_DIR="$HOME/.oh-my-zsh"
+if [[ -f "$OMZ_DIR/oh-my-zsh.sh" ]]; then
+    ui_ok "Oh My Zsh already installed"
+else
+    [[ -e "$OMZ_DIR" ]] && err "$OMZ_DIR exists but has no oh-my-zsh.sh — remove it and re-run."
+    command -v git >/dev/null 2>&1 || err "git is required to install Oh My Zsh."
+    ui_info "Cloning Oh My Zsh..."
+    git clone -q https://github.com/ohmyzsh/ohmyzsh.git "$OMZ_DIR" ||
+        err "Oh My Zsh clone failed."
+    [[ -f "$OMZ_DIR/oh-my-zsh.sh" ]] ||
+        err "Oh My Zsh installation incomplete ($OMZ_DIR/oh-my-zsh.sh missing)."
+    ui_ok "Oh My Zsh installed"
+fi
+
+# ---------------------------------------------------------- [2/6] plugins
+ui_sub "Plugins"
+
+PLUGIN_DIR="$OMZ_DIR/custom/plugins"
+
+# name | repository url | file that must exist once installed
+install_plugin() {
+    local name="$1" url="$2" expected="$3"
+    local dir="$PLUGIN_DIR/$name"
+
+    if [[ -f "$dir/$expected" ]]; then
+        ui_ok "$name"
+        return 0
+    fi
+
+    if [[ -d "$dir" ]]; then
+        # Directory exists but the plugin file does not: repair in place,
+        # never reclone over an existing installation.
+        if [[ -d "$dir/.git" ]]; then
+            ui_info "$name: incomplete installation, updating..."
+            git -C "$dir" pull -q --ff-only ||
+                err "$name: existing installation at $dir is incomplete and could not be updated."
+        else
+            err "$name: $dir exists but is not a valid plugin installation."
+        fi
+    else
+        command -v git >/dev/null 2>&1 || err "git is required to install $name."
+        ui_info "Cloning $name..."
+        mkdir -p "$PLUGIN_DIR" || err "Cannot create $PLUGIN_DIR."
+        git clone -q "$url" "$dir" ||
+            err "$name: clone failed ($url)."
+    fi
+
+    [[ -f "$dir/$expected" ]] ||
+        err "$name: expected file $dir/$expected is still missing."
+    ui_ok "$name"
+}
+
+install_plugin zsh-syntax-highlighting \
+    https://github.com/zsh-users/zsh-syntax-highlighting.git \
+    zsh-syntax-highlighting.zsh
+install_plugin zsh-autosuggestions \
+    https://github.com/zsh-users/zsh-autosuggestions.git \
+    zsh-autosuggestions.zsh
+install_plugin zsh-system-clipboard \
+    https://github.com/kutsan/zsh-system-clipboard.git \
+    zsh-system-clipboard.zsh
+
 # -------------------------------------------------------- [3/6] validate src
-echo "[3/6] Validating BuBuZsh source..."
+ui_stage "3/6" "Validating BuBuZsh source..."
 
 for required in "$SRC_DIR" "$SRC_DIR/.zshenv" "$SRC_DIR/.zshrc" \
                 "$SRC_DIR/TerminZsh_Banner"; do
@@ -122,10 +279,10 @@ while IFS= read -r f; do
     fi
 done < <(find "$SRC_DIR" \( -name '*.zsh' -o -name '.zshrc' -o -name '.zshenv' \) -type f)
 (( src_syntax_fail == 0 )) || exit 1
-echo "      Source OK ($src_count files passed zsh -n)"
+ui_ok "Source OK ($src_count files passed zsh -n)"
 
 # ------------------------------------------------------- [4/6] backup + copy
-echo "[4/6] Creating backup and installing BuBuZsh..."
+ui_stage "4/6" "Creating backup and installing BuBuZsh..."
 
 TARGET="$HOME/.config/zsh"
 BACKUP="(none — no existing configuration)"
@@ -145,7 +302,9 @@ if [[ -e "$HOME/.zshenv" || -e "$TARGET" ]]; then
     if [[ -e "$TARGET" ]]; then
         cp -a "$TARGET" "$BACKUP/zsh" || err "Backup failed."
     fi
-    echo "      Existing configuration backed up to: $BACKUP"
+    ui_ok "Backup created: $BACKUP"
+else
+    ui_info "No existing configuration — backup not needed"
 fi
 
 # copy-based install (never symlinks): stage first, then activate
@@ -161,11 +320,11 @@ cp -a "$SRC_DIR/.zshenv" "$HOME/.zshenv" || err "Could not write ~/.zshenv."
 [[ -d "$TARGET/TerminZsh_Banner" ]] ||
     err "Banner directory was not installed."
 
-echo "      Installed: $TARGET"
-echo "      Installed: $HOME/.zshenv"
+ui_ok "Installed: $TARGET"
+ui_ok "Installed: $HOME/.zshenv"
 
 # ------------------------------------------------ [5/6] validate + startup
-echo "[5/6] Validating installed configuration..."
+ui_stage "5/6" "Validating installed configuration..."
 
 inst_syntax_fail=0
 inst_count=0
@@ -177,7 +336,7 @@ while IFS= read -r f; do
     fi
 done < <(find "$TARGET" \( -name '*.zsh' -o -name '.zshrc' -o -name '.zshenv' \) -type f)
 (( inst_syntax_fail == 0 )) || exit 1
-echo "      zsh -n: OK ($inst_count installed files)"
+ui_ok "zsh -n passed ($inst_count installed files)"
 
 # Non-destructive startup test. stdin comes from /dev/null so the test can
 # never block the installer (an interactive shell started under a
@@ -190,12 +349,13 @@ if (( startup_rc != 0 )) || [[ -n "$startup_err" ]]; then
     [[ -z "$startup_err" ]] || printf '%s\n' "$startup_err" >&2
     err "Startup test failed (RC=$startup_rc)."
 fi
-echo "      Startup test: RC=0, stderr empty"
+ui_ok "Startup test passed (RC=0, stderr empty)"
 
 # ------------------------------------------------------------- [6/6] done
-echo "[6/6] Installation complete"
-echo "      Config: $TARGET"
-echo "      Zshenv: $HOME/.zshenv"
-echo "      Backup: $BACKUP"
-echo "      Start a new zsh session to use BuBuZsh."
+ui_stage "6/6" "Complete"
+ui_kv "Config" "$TARGET"
+ui_kv "Zshenv" "$HOME/.zshenv"
+ui_kv "Backup" "$BACKUP"
+ui_info "Start a new zsh session to use BuBuZsh."
+ui_done
 exit 0
